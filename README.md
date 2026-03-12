@@ -4,15 +4,19 @@ A production-ready reverse proxy that forwards Claude Code API requests to OpenR
 
 ## Features
 
-- **Full API Compatibility**: Implements Claude Code's `/v1/messages` endpoint
-- **Message Filtering**: Automatically removes suggestion mode triggers
+- **Full API Compatibility**: Implements Claude Code's `/v1/messages` endpoint (both streaming and non-streaming)
+- **Automatic Model Transformation**:
+  - Claude models → `stepfun/step-3.5-flash:free`
+  - Other non-StepFun models → `nvidia/nemotron-3-nano-30b-a3b:free`
+- **Message Filtering**: Automatically removes suggestion mode triggers from both requests and responses
 - **Production Ready**:
   - Thread-safe metrics tracking
   - Graceful shutdown with request draining
   - Health check endpoint (`/health`)
-  - Request timeout handling (120s)
+  - Configurable timeout (default 30min)
   - Stack traces on errors for debugging
-- **Observability**: Structured logging with file output, metrics aggregation
+  - HTTP transport with connection pooling
+- **Observability**: Structured logging with file output, user query logging, metrics aggregation
 - **Secure**: No sensitive data in logs, proper error responses
 - **Zero Configuration**: Works out of the box with sensible defaults
 
@@ -77,7 +81,7 @@ Replace `your-server-ip` with your EC2 instance's public IP or domain.
 | `OPENROUTER_API_KEY` | **Required.** Your OpenRouter API key | (none) |
 | `PORT` | Port to listen on | `8080` |
 | `LOG_FILE` | Path to log file | `./logs/claude-proxy.log` (auto-created) |
-| `OPENROUTER_TIMEOUT` | Timeout for OpenRouter requests | `120s` |
+| `OPENROUTER_TIMEOUT` | Timeout for OpenRouter requests (supports durations like `30m`, `5m`, `120s`) | `30m` |
 
 ### Example with Docker
 
@@ -104,7 +108,7 @@ docker run -d -p 8080:8080 -e OPENROUTER_API_KEY=your-key openrouter-proxy
 
 ### `POST /v1/messages`
 
-Accepts the same request format as Anthropic's Claude API.
+Accepts the same request format as Anthropic's Claude API. Supports both streaming (`"stream": true`) and non-streaming responses.
 
 **Request:**
 ```json
@@ -118,7 +122,14 @@ Accepts the same request format as Anthropic's Claude API.
 ```
 
 **Response:**
-Same as OpenRouter's response format. Content blocks are filtered to only include `text`, `thinking`, and `tool_use` types (Claude Code compatible).
+- Non-streaming: Returns a single JSON response with the same format as OpenRouter. Content blocks are filtered to only include `text`, `thinking`, and `tool_use` types (Claude Code compatible). Suggestion mode triggers are removed.
+- Streaming: Returns Server-Sent Events (SSE) stream when `"stream": true`. The stream is forwarded directly from OpenRouter with minimal buffering.
+
+**Note on Model Names:**
+The proxy automatically transforms model names to use OpenRouter's free tier:
+- Models starting with `claude` → `stepfun/step-3.5-flash:free`
+- All other models (except those starting with `stepfun`) → `nvidia/nemotron-3-nano-30b-a3b:free`
+- Models starting with `stepfun` are passed through unchanged
 
 ### `GET /health`
 
@@ -187,7 +198,9 @@ Allow inbound traffic on port `8080` (or your chosen port) from your IP or 0.0.0
 ## Monitoring
 
 - **Logs**: Written to both stdout and `LOG_FILE` (default: `./logs/claude-proxy.log`)
-- **Metrics**: Periodic logs every 60s showing average API response times
+  - Includes user queries, model transformations, request durations, and errors
+  - User messages are logged to help debug issues
+- **Metrics**: Periodic logs every 60s showing average API response times for both full requests and OpenRouter API calls
 - **Health**: `GET /health` returns 200 if service is alive
 
 ## Troubleshooting
@@ -217,7 +230,9 @@ ls -la logs/
 ### OpenRouter errors
 - Ensure your API key is valid and has credits
 - Check [OpenRouter status](https://openrouter.ai/status)
-- Verify model name is correct (use format: `anthropic/claude-sonnet-4-5-20250930`)
+- The proxy automatically transforms model names to free tier models; no need to specify exact model names
+- Logs will show model transformation and user queries for debugging
+- If streaming fails, the proxy falls back to non-streaming automatically
 
 ## Development
 
@@ -232,21 +247,24 @@ air
 # Start server
 ./openrouter-proxy
 
-# In another terminal
+# In another terminal - test with streaming
 curl -X POST http://localhost:8080/v1/messages \
   -H "Content-Type: application/json" \
   -d '{"model":"anthropic/claude-3-5-sonnet-20241022","max_tokens":100,"messages":[{"role":"user","content":"test"}]}'
+
+# The model name will be auto-transformed to a free tier model on OpenRouter
 ```
 
 ## How It Works
 
 1. Claude Code sends request to `/v1/messages` on your proxy server
-2. Proxy validates the request body
-3. Filters out messages containing `[SUGGESTION MODE:...]` triggers
-4. Forwards request to OpenRouter with your API key
-5. Receives response, filters content blocks to only `text`, `thinking`, `tool_use`
-6. Returns filtered response to Claude Code
-7. Metrics are logged every 60 seconds
+2. Proxy validates the request body and logs the user query
+3. Filters out messages containing `[SUGGESTION MODE:...]` triggers from both requests and responses
+4. Transforms model name based on rules (see API Reference)
+5. Forwards request to OpenRouter with your API key and configured timeout
+6. If `stream: true`, streams the response from OpenRouter to Claude Code in real-time with minimal buffering
+7. If `stream: false`, collects full response, filters content blocks to only `text`, `thinking`, and `tool_use`, then returns
+8. Metrics (FULL_REQUEST, OPENROUTER_API_CALL) are logged periodically
 
 ## License
 
