@@ -1,8 +1,8 @@
 # Binaries (ignore all built binaries)
 claude-proxy
 openrouter-proxy*
+open-router-proxy**.exe
 open-router-proxy*
-*.exe
 *.exe~
 *.dll
 *.so

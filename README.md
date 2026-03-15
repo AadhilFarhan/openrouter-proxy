@@ -15,10 +15,12 @@ A production-ready reverse proxy that forwards Claude Code API requests to OpenR
   - Health check endpoint (`/health`)
   - Configurable timeout (default 30min)
   - Stack traces on errors for debugging
-  - HTTP transport with connection pooling
-- **Observability**: Structured logging with file output, user query logging, metrics aggregation
+  - High-performance HTTP transport with connection pooling
+  - Request size limit protection (10MB)
+- **Observability**: Structured logging with file output, configurable user query logging, metrics aggregation
 - **Secure**: No sensitive data in logs, proper error responses
 - **Zero Configuration**: Works out of the box with sensible defaults
+- **Optimized Streaming**: 64KB buffered writes and 32KB buffered reads for maximum throughput
 
 ## Quick Start
 
@@ -81,6 +83,7 @@ Replace `your-server-ip` with your EC2 instance's public IP or domain.
 | `OPENROUTER_API_KEY` | **Required.** Your OpenRouter API key | (none) |
 | `PORT` | Port to listen on | `8080` |
 | `LOG_FILE` | Path to log file | `./logs/claude-proxy.log` (auto-created) |
+| `LOG_QUERIES` | Enable/disable user query logging | `true` |
 | `OPENROUTER_TIMEOUT` | Timeout for OpenRouter requests (supports durations like `30m`, `5m`, `120s`) | `30m` |
 
 ### Example with Docker
@@ -101,7 +104,10 @@ CMD ["openrouter-proxy"]
 
 ```bash
 docker build -t openrouter-proxy .
-docker run -d -p 8080:8080 -e OPENROUTER_API_KEY=your-key openrouter-proxy
+docker run -d -p 8080:8080 \
+  -e OPENROUTER_API_KEY=your-key \
+  -e LOG_QUERIES=true \
+  openrouter-proxy
 ```
 
 ## API Reference
@@ -198,10 +204,12 @@ Allow inbound traffic on port `8080` (or your chosen port) from your IP or 0.0.0
 ## Monitoring
 
 - **Logs**: Written to both stdout and `LOG_FILE` (default: `./logs/claude-proxy.log`)
-  - Includes user queries, model transformations, request durations, and errors
+  - Includes user queries (when `LOG_QUERIES=true`), model transformations, request durations, and errors
   - User messages are logged to help debug issues
+  - Stack traces included for error debugging
 - **Metrics**: Periodic logs every 60s showing average API response times for both full requests and OpenRouter API calls
 - **Health**: `GET /health` returns 200 if service is alive
+- **Performance**: Optimized HTTP transport with 200 max idle connections, 50 per-host connections, and 120s idle timeout for high-concurrency scenarios
 
 ## Troubleshooting
 
@@ -222,6 +230,15 @@ The `logs/` directory is auto-created. Check permissions:
 ls -la logs/
 ```
 
+### Query logging disabled
+To disable user query logging for privacy or compliance:
+```bash
+export LOG_QUERIES=false
+```
+
+### Request too large
+The proxy enforces a 10MB request size limit. If you get a "request body too large" error, reduce the size of your request (typically caused by very long conversations or large file uploads).
+
 ### Cannot connect from Claude Code
 1. Check security group allows port 8080
 2. Verify server is running: `curl http://your-server:8080/health`
@@ -231,8 +248,9 @@ ls -la logs/
 - Ensure your API key is valid and has credits
 - Check [OpenRouter status](https://openrouter.ai/status)
 - The proxy automatically transforms model names to free tier models; no need to specify exact model names
-- Logs will show model transformation and user queries for debugging
+- Logs will show model transformation and user queries (if enabled) for debugging
 - If streaming fails, the proxy falls back to non-streaming automatically
+- For timeout errors, increase `OPENROUTER_TIMEOUT` (default 30 minutes)
 
 ## Development
 
@@ -258,11 +276,11 @@ curl -X POST http://localhost:8080/v1/messages \
 ## How It Works
 
 1. Claude Code sends request to `/v1/messages` on your proxy server
-2. Proxy validates the request body and logs the user query
+2. Proxy validates the request body (enforces 10MB size limit) and logs the user query (if enabled)
 3. Filters out messages containing `[SUGGESTION MODE:...]` triggers from both requests and responses
 4. Transforms model name based on rules (see API Reference)
-5. Forwards request to OpenRouter with your API key and configured timeout
-6. If `stream: true`, streams the response from OpenRouter to Claude Code in real-time with minimal buffering
+5. Forwards request to OpenRouter with your API key and configured timeout (default 30min)
+6. If `stream: true`, streams the response from OpenRouter to Claude Code in real-time using buffered I/O (64KB write buffer, 32KB read buffer) for optimal throughput
 7. If `stream: false`, collects full response, filters content blocks to only `text`, `thinking`, and `tool_use`, then returns
 8. Metrics (FULL_REQUEST, OPENROUTER_API_CALL) are logged periodically
 
