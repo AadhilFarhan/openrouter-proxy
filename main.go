@@ -30,6 +30,7 @@ type Server struct {
 	metrics          *MetricsCollector
 	openRouterClient *http.Client
 	timeout          time.Duration
+	logQueries       bool
 }
 
 type MetricsCollector struct {
@@ -106,15 +107,28 @@ func LoadConfig() (*Server, error) {
 		}
 	}
 
-	// Configure transport with connection pool limits
+	// Configure query logging (default: enabled)
+	logQueries := true
+	if logQueriesStr := os.Getenv("LOG_QUERIES"); logQueriesStr != "" {
+		if parsed, err := strconv.ParseBool(logQueriesStr); err != nil {
+			return nil, fmt.Errorf("invalid LOG_QUERIES: %w", err)
+		} else {
+			logQueries = parsed
+		}
+	}
+
+	// Configure transport with optimized connection pool limits
 	transport := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		MaxConnsPerHost:     100,
-		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConns:        200,              // Increased from 100
+		MaxIdleConnsPerHost: 50,               // Increased from 10
+		MaxConnsPerHost:     200,              // Increased from 100
+		IdleConnTimeout:     120 * time.Second, // Increased from 90s
 		DisableCompression:  false,
 		ForceAttemptHTTP2:   true,
+		// Additional optimizations
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 	}
 
 	return &Server{
@@ -122,6 +136,7 @@ func LoadConfig() (*Server, error) {
 		logFile:          logFile,
 		port:             port,
 		timeout:          timeout,
+		logQueries:       logQueries,
 		metrics:          NewMetricsCollector(),
 		openRouterClient: &http.Client{Transport: transport, Timeout: timeout},
 	}, nil
@@ -213,6 +228,10 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 
 	s.logger.Printf("Received %s request for %s", req.Method, req.URL.Path)
 
+	// Enforce request size limit (default: 10MB)
+	const maxRequestSize = 10 << 20 // 10MB
+	req.Body = http.MaxBytesReader(w, req.Body, maxRequestSize)
+
 	body, err := io.ReadAll(req.Body)
 	if err != nil {
 		s.logError("Error while reading body", err)
@@ -227,8 +246,10 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Log the user query (extracted from user messages)
-	s.logUserQuery(claudeReq)
+	// Log the user query (extracted from user messages) if enabled
+	if s.logQueries {
+		s.logUserQuery(claudeReq)
+	}
 
 	messages, ok := claudeReq["messages"].([]interface{})
 	if !ok {
@@ -451,27 +472,35 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, reqToOpenRouter 
 		return
 	}
 
-	// Stream the response from OpenRouter to the client
-	// Use a buffered reader for efficient reading.
-	const bufSize = 32 * 1024 // 32 KB buffer
-	buf := make([]byte, bufSize)
+	// Stream the response from OpenRouter to the client with buffered writer
+	// Use a buffered writer to reduce flush frequency and improve throughput
+	const bufSize = 64 * 1024 // 64KB buffer for buffered writes
+	bufWriter := bufio.NewWriterSize(w, bufSize)
+	defer bufWriter.Flush() // Ensure any remaining data is flushed on exit
+
+	// Use a buffered reader and a separate byte buffer for reading
 	reader := bufio.NewReader(resp.Body)
+	readBuf := make([]byte, 32*1024) // 32KB read buffer
+
 	for {
 		select {
 		case <-ctx.Done():
 			s.logger.Println("Streaming request cancelled by client")
+			_ = bufWriter.Flush()
 			return
 		default:
-			n, err := reader.Read(buf)
+			n, err := reader.Read(readBuf)
 			if n > 0 {
-				// Forward the chunk to the client
-				if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				// Write to buffered writer
+				if _, writeErr := bufWriter.Write(readBuf[:n]); writeErr != nil {
 					s.logError("Error writing to client", writeErr)
+					_ = bufWriter.Flush()
 					return
 				}
-				// Flush to ensure immediate delivery
-				if flusher, ok := w.(http.Flusher); ok {
-					flusher.Flush()
+				// Flush buffered data to client
+				if flushErr := bufWriter.Flush(); flushErr != nil {
+					s.logError("Error flushing buffer to client", flushErr)
+					return
 				}
 			}
 			if err != nil {
