@@ -120,9 +120,9 @@ func LoadConfig() (*Server, error) {
 	// Configure transport with optimized connection pool limits
 	transport := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
-		MaxIdleConns:        200,              // Increased from 100
-		MaxIdleConnsPerHost: 50,               // Increased from 10
-		MaxConnsPerHost:     200,              // Increased from 100
+		MaxIdleConns:        200,               // Increased from 100
+		MaxIdleConnsPerHost: 50,                // Increased from 10
+		MaxConnsPerHost:     200,               // Increased from 100
 		IdleConnTimeout:     120 * time.Second, // Increased from 90s
 		DisableCompression:  false,
 		ForceAttemptHTTP2:   true,
@@ -158,6 +158,7 @@ func (s *Server) Init() error {
 
 func (s *Server) Start() error {
 	http.HandleFunc("/v1/messages", s.messageHandler)
+	http.HandleFunc("/v1/chat/completions", s.messageHandler)
 	http.HandleFunc("/health", s.healthCheck)
 
 	s.logger.Printf("Server starting on http://localhost:%s", s.port)
