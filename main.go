@@ -317,6 +317,8 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	delete(claudeReq, "context_management") // Remove context management field if present, as OpenRouter may not support it
+
 	cleanedBody, err := json.Marshal(claudeReq)
 	if err != nil {
 		s.logError("Failed to marshal cleaned request", err)
