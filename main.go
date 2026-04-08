@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -27,15 +26,32 @@ type Server struct {
 	logFile          string
 	port             string
 	logger           *log.Logger
+	queryLogger      *log.Logger // Separate logger for prompts and outputs
 	metrics          *MetricsCollector
 	openRouterClient *http.Client
 	timeout          time.Duration
 	logQueries       bool
+	models           *ModelResponse
 }
 
 type MetricsCollector struct {
 	mu     sync.RWMutex
 	timers map[string][]float64
+}
+
+type OpenRouterModelResponse struct {
+	Data []struct {
+		Id   string `json:"id"`
+		Name string `json:"name"`
+	}
+}
+
+type ModelResponse struct {
+	mu                             sync.RWMutex
+	IdNameMap                      map[string]string
+	NameIdMap                      map[string]string
+	LastUpdated                    time.Time
+	ModelNameToFreeModelIdCacheMap map[string]string
 }
 
 func NewMetricsCollector() *MetricsCollector {
@@ -153,6 +169,26 @@ func (s *Server) Init() error {
 
 	s.logger = log.New(io.MultiWriter(os.Stdout, f), "claude-proxy: ", log.LstdFlags|log.Lshortfile)
 	s.logger.Println("Initialized successfully")
+
+	// Initialize query logger (separate file for prompts and outputs)
+	if s.logQueries {
+		exePath, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("failed to get executable path: %w", err)
+		}
+		baseDir := filepath.Dir(exePath)
+		logDir := filepath.Join(baseDir, "logs")
+		if err := os.MkdirAll(logDir, 0755); err != nil {
+			return fmt.Errorf("failed to create log directory: %w", err)
+		}
+		queryLogFile := filepath.Join(logDir, "queries.log")
+		queryFile, err := os.OpenFile(queryLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("failed to open query log file: %w", err)
+		}
+		s.queryLogger = log.New(queryFile, "", 0) // No prefix, no timestamps — clean JSON only
+	}
+
 	return nil
 }
 
@@ -195,6 +231,9 @@ func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) logUserQuery(claudeReq map[string]interface{}) {
+	if s.queryLogger == nil {
+		return
+	}
 	if messages, ok := claudeReq["messages"].([]interface{}); ok {
 		var userQueries []string
 		for _, msg := range messages {
@@ -203,7 +242,6 @@ func (s *Server) logUserQuery(claudeReq map[string]interface{}) {
 					if content, ok := m["content"].(string); ok {
 						userQueries = append(userQueries, content)
 					} else if contentArr, ok := m["content"].([]interface{}); ok {
-						// Handle array of content blocks
 						for _, block := range contentArr {
 							if b, ok := block.(map[string]interface{}); ok {
 								if bType, ok := b["type"].(string); ok && bType == "text" {
@@ -218,7 +256,8 @@ func (s *Server) logUserQuery(claudeReq map[string]interface{}) {
 			}
 		}
 		if len(userQueries) > 0 {
-			s.logger.Printf("User query: %s", strings.Join(userQueries, " | "))
+			s.logger.Printf("User query logged") // operational log
+			s.queryLogger.Printf("=== REQUEST ===\n%s", strings.Join(userQueries, " | "))
 		}
 	}
 }
@@ -308,23 +347,30 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 
 	// Transform model name based on rules
 	if model, ok := claudeReq["model"].(string); ok {
-		if strings.HasPrefix(model, "claude") {
+		if strings.HasPrefix(model, "claude") || strings.HasPrefix(model, "step") {
 			claudeReq["model"] = "stepfun/step-3.5-flash:free"
 			s.logger.Printf("Transformed model '%s' to 'stepfun/step-3.5-flash:free'", model)
-		} else if !strings.HasPrefix(model, "stepfun") {
-			claudeReq["model"] = "nvidia/nemotron-3-nano-30b-a3b:free"
-			s.logger.Printf("Transformed model '%s' to 'nvidia/nemotron-3-nano-30b-a3b:free'", model)
+		} else {
+			modelName := s.models.GetModelName(model) // Just for logging
+			if modelName == "unknown-model" {
+				s.logger.Printf("Checking if model id exists for '%s' in OpenRouter", model)
+				modelId := s.models.GetModelId(model)
+				if modelId == "unknown-model" {
+					s.logger.Printf("Model '%s' does not have a free version in OpenRouter, using original model name", model)
+				} else {
+					claudeReq["model"] = modelId
+					s.logger.Printf("Resolved model '%s' to free model ID '%s'", model, modelId)
+				}
+			} else if strings.Contains(model, "free") {
+				s.logger.Printf("Model '%s' exists in OpenRouter with name '%s'", model, modelName)
+				claudeReq["model"] = model
+			} else {
+				s.logger.Printf("Model '%s' does not have a free version in OpenRouter. Skipping request.Proxy supports free models only.", model)
+			}
 		}
 	}
 
 	delete(claudeReq, "context_management") // Remove context management field if present, as OpenRouter may not support it
-
-	cleanedBody, err := json.Marshal(claudeReq)
-	if err != nil {
-		s.logError("Failed to marshal cleaned request", err)
-		s.writeError(w, http.StatusInternalServerError, "Internal server error")
-		return
-	}
 
 	// Check if streaming is requested
 	streamRequested := false
@@ -332,40 +378,95 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 		streamRequested = streamVal
 	}
 
-	reqToOpenRouter, err := http.NewRequestWithContext(ctx, "POST", "https://openrouter.ai/api/v1/messages", bytes.NewBuffer(cleanedBody))
-	if err != nil {
-		s.logError("Error while creating request", err)
-		s.writeError(w, http.StatusInternalServerError, "Failed to create request")
-		return
+	// Retry loop: try primary model, fallback to stepfun on persistent errors
+	const maxRetries = 4
+	retryableModels := []string{"stepfun/step-3.5-flash:free", "qwen/qwen3.6-plus:free"}
+	if model, ok := claudeReq["model"].(string); ok {
+		retryableModels[0] = model
 	}
 
-	reqToOpenRouter.Header.Set("Content-Type", "application/json")
-	reqToOpenRouter.Header.Set("Authorization", "Bearer "+s.apiKey)
-	reqToOpenRouter.Header.Set("HTTP-Referer", "http://localhost:8080")
-	reqToOpenRouter.Header.Set("X-Title", "Claude-Code-Proxy")
-
 	startTime := time.Now()
+	var resp *http.Response
+	var usedModel string
 
-	if streamRequested {
-		// Handle streaming response
-		s.handleStreamingResponse(w, reqToOpenRouter)
-	} else {
-		// Handle non-streaming response (existing logic)
-		resp, err := s.openRouterClient.Do(reqToOpenRouter)
+	for _, modelToTry := range retryableModels {
+		usedModel = modelToTry
+		claudeReq["model"] = modelToTry
+		bodyForRequest, err := json.Marshal(claudeReq)
 		if err != nil {
-			// Check for timeout
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				s.logError("OpenRouter request timeout", err)
-				s.writeError(w, http.StatusGatewayTimeout, "OpenRouter request timed out after "+s.timeout.String())
-				return
-			}
-			s.logError("Error while sending request to OpenRouter", err)
-			s.writeError(w, http.StatusBadGateway, "Failed to reach OpenRouter")
+			s.logError("Failed to marshal request for model "+modelToTry, err)
+			s.writeError(w, http.StatusInternalServerError, "Internal server error")
 			return
 		}
-		defer resp.Body.Close()
 
+		if modelToTry != retryableModels[0] {
+			s.logger.Printf("Primary model failed after %d attempts, falling back to %s", maxRetries, modelToTry)
+		}
+
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			rt, err := http.NewRequestWithContext(ctx, "POST", "https://openrouter.ai/api/v1/messages", bytes.NewReader(bodyForRequest))
+			if err != nil {
+				s.logError("Error while creating request for model "+modelToTry, err)
+				s.writeError(w, http.StatusInternalServerError, "Failed to create request")
+				return
+			}
+			rt.Header.Set("Content-Type", "application/json")
+			rt.Header.Set("Authorization", "Bearer "+s.apiKey)
+			rt.Header.Set("HTTP-Referer", "http://localhost:8080")
+			rt.Header.Set("X-Title", "Claude-Code-Proxy")
+
+			resp, err = s.openRouterClient.Do(rt)
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					s.logger.Printf("OpenRouter request timeout (model: %s, attempt %d/%d)", modelToTry, attempt+1, maxRetries)
+				} else {
+					s.logger.Printf("OpenRouter request error (model: %s, attempt %d/%d): %v", modelToTry, attempt+1, maxRetries, err)
+				}
+				if attempt < maxRetries-1 {
+					time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
+				}
+				resp = nil
+				continue
+			}
+
+			// 429 or 5xx errors are retryable
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+
+			s.logger.Printf("OpenRouter returned %d (model: %s, attempt %d/%d)", resp.StatusCode, modelToTry, attempt+1, maxRetries)
+			if resp.StatusCode >= 400 && attempt < maxRetries-1 {
+				resp.Body.Close()
+				resp = nil
+				continue
+			}
+
+			// Non-retryable error or last attempt
+			break
+		}
+
+		if resp != nil && resp.StatusCode == http.StatusOK {
+			break
+		}
+		if resp != nil && resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+		}
+		resp = nil
+	}
+
+	if resp == nil {
+		modelList := strings.Join(retryableModels, ", ")
+		s.writeError(w, http.StatusBadGateway, fmt.Sprintf("Failed to reach OpenRouter after retries (tried: %s)", modelList))
+		s.logger.Printf("All retry attempts exhausted for models: %v", retryableModels)
+		return
+	}
+	s.logger.Printf("Request successful with model: %s", usedModel)
+
+	if streamRequested {
+		s.handleStreamingResponse(w, resp, ctx)
+	} else {
 		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close() // Close immediately after reading
 		if err != nil {
 			s.logError("Error while reading response body", err)
 			s.writeError(w, http.StatusBadGateway, "Failed to read response from OpenRouter")
@@ -376,13 +477,9 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 		s.metrics.Record("OPENROUTER_API_CALL", duration.Seconds())
 		s.logger.Printf("OpenRouter API call completed in %v", duration)
 
-		if resp.StatusCode != http.StatusOK {
-			s.logger.Printf("Received non-OK response from OpenRouter: %d %s", resp.StatusCode, string(respBody))
-			s.writeError(w, http.StatusBadGateway, fmt.Sprintf("OpenRouter error: %d", resp.StatusCode))
-			return
+		if s.queryLogger != nil {
+			s.queryLogger.Printf("=== RESPONSE ===\n%s", string(respBody))
 		}
-
-		s.logger.Printf("OpenRouter raw response: %s", string(respBody))
 
 		var data map[string]interface{}
 		if err := json.Unmarshal(respBody, &data); err != nil {
@@ -439,81 +536,113 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func (s *Server) handleStreamingResponse(w http.ResponseWriter, reqToOpenRouter *http.Request) {
-	ctx := reqToOpenRouter.Context()
-
+func (s *Server) handleStreamingResponse(w http.ResponseWriter, resp *http.Response, ctx context.Context) {
 	// Set headers for streaming
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Transfer-Encoding", "chunked")
 
-	// Flush the headers immediately
+	// Copy important headers from OpenRouter response
+	for k, v := range resp.Header {
+		// Skip headers that would conflict with our streaming setup
+		switch strings.ToLower(k) {
+		case "content-length", "content-encoding", "transfer-encoding":
+			continue
+		}
+		for _, vv := range v {
+			w.Header().Add(k, vv)
+		}
+	}
+
+	// Flush headers immediately
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
 
-	resp, err := s.openRouterClient.Do(reqToOpenRouter)
-	if err != nil {
-		// Check for timeout
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			s.logError("OpenRouter streaming request timeout", err)
-			s.writeError(w, http.StatusGatewayTimeout, "OpenRouter request timed out after "+s.timeout.String())
-		} else {
-			s.logError("Error while sending streaming request to OpenRouter", err)
-			s.writeError(w, http.StatusBadGateway, "Failed to reach OpenRouter")
-		}
-		return
-	}
+	// Ensure response body is closed when we exit
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		// Read error body
-		errBody, _ := io.ReadAll(resp.Body)
-		s.logger.Printf("OpenRouter returned non-OK status: %d, body: %s", resp.StatusCode, string(errBody))
-		s.writeError(w, http.StatusBadGateway, fmt.Sprintf("OpenRouter error: %d", resp.StatusCode))
-		return
-	}
+	// Use a moderate buffer to reduce syscalls
+	const bufSize = 16 * 1024
+	buf := make([]byte, bufSize)
 
-	// Stream the response from OpenRouter to the client with buffered writer
-	// Use a buffered writer to reduce flush frequency and improve throughput
-	const bufSize = 64 * 1024 // 64KB buffer for buffered writes
-	bufWriter := bufio.NewWriterSize(w, bufSize)
-	defer bufWriter.Flush() // Ensure any remaining data is flushed on exit
+	// ============================================================
+	// KEEPALIVE (commented out — see below)
+	// ============================================================
+	// Keepalive prevents idle connection drops from load balancers
+	// and proxies by sending SSE comment lines every 15 seconds.
+	//
+	// Disabled because:
+	// 1. Claude streams continuously (~100–500ms between tokens), so
+	//    idle timeouts are unlikely in practice.
+	// 2. Concurrent writes to w.Data-race between reader and keepalive
+	//    goroutines (http.ResponseWriter is not thread-safe).
+	// 3. If needed, use a single-goroutine approach with select{} to
+	//    merge keepalive into the reader loop, or use a mutex.
+	//
+	// keepaliveDone := make(chan struct{})
+	// go func() {
+	// 	defer close(keepaliveDone)
+	// 	ticker := time.NewTicker(15 * time.Second)
+	// 	defer ticker.Stop()
+	// 	for {
+	// 		select {
+	// 		case <-ctx.Done():
+	// 			return
+	// 		case <-ticker.C:
+	// 			_, err := w.Write([]byte(": keepalive\n\n"))
+	// 			if err != nil {
+	// 				return
+	// 			}
+	// 			if f, ok := w.(http.Flusher); ok {
+	// 				_ = f.Flush()
+	// 			}
+	// 		}
+	// 	}
+	// }()
+	// defer func() { <-keepaliveDone }()
 
-	// Use a buffered reader and a separate byte buffer for reading
-	reader := bufio.NewReader(resp.Body)
-	readBuf := make([]byte, 32*1024) // 32KB read buffer
+	// Stream using a goroutine for reading with cancellation support
+	readerDone := make(chan error, 1)
 
-	for {
-		select {
-		case <-ctx.Done():
-			s.logger.Println("Streaming request cancelled by client")
-			_ = bufWriter.Flush()
-			return
-		default:
-			n, err := reader.Read(readBuf)
+	go func() {
+		defer close(readerDone)
+		for {
+			n, err := resp.Body.Read(buf)
 			if n > 0 {
-				// Write to buffered writer
-				if _, writeErr := bufWriter.Write(readBuf[:n]); writeErr != nil {
-					s.logError("Error writing to client", writeErr)
-					_ = bufWriter.Flush()
+				// Send data to client
+				_, writeErr := w.Write(buf[:n])
+				if writeErr != nil {
+					readerDone <- writeErr
 					return
 				}
-				// Flush buffered data to client
-				if flushErr := bufWriter.Flush(); flushErr != nil {
-					s.logError("Error flushing buffer to client", flushErr)
-					return
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
 				}
 			}
 			if err != nil {
 				if errors.Is(err, io.EOF) {
-					s.logger.Println("OpenRouter stream ended")
+					readerDone <- nil
 				} else {
-					s.logError("Error reading from OpenRouter stream", err)
+					readerDone <- err
 				}
 				return
 			}
+		}
+	}()
+
+	// Wait for either read completion or client cancellation
+	select {
+	case <-ctx.Done():
+		// Client disconnected — stop streaming
+		s.logger.Println("Streaming request cancelled by client")
+		return
+	case err := <-readerDone:
+		if err != nil && !errors.Is(err, io.EOF) {
+			s.logError("Streaming error", err)
+		} else if err == nil {
+			s.logger.Println("OpenRouter stream ended normally")
 		}
 	}
 }
@@ -530,11 +659,86 @@ func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
 	})
 }
 
+func (mr *ModelResponse) BuildModelMaps() {
+	idNameMap := make(map[string]string)
+	nameIdMap := make(map[string]string)
+
+	req, err := http.NewRequest("GET", "https://openrouter.ai/api/v1/models", nil)
+	if err != nil {
+		log.Printf("Error creating model fetch request: %v", err)
+		return
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", os.Getenv("OPENROUTER_API_KEY")))
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Error fetching models from OpenRouter: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var modelResp OpenRouterModelResponse
+	if err := json.NewDecoder(resp.Body).Decode(&modelResp); err != nil {
+		log.Printf("Error decoding model response: %v", err)
+		return
+	}
+
+	for _, model := range modelResp.Data {
+		idNameMap[model.Id] = model.Name
+		nameIdMap[model.Name] = model.Id
+	}
+	log.Printf("Building model maps from OpenRouter \n")
+	mr.IdNameMap = idNameMap
+	mr.NameIdMap = nameIdMap
+	mr.LastUpdated = time.Now()
+}
+
+func (mr *ModelResponse) GetModelName(id string) string {
+	if mr.IdNameMap == nil || time.Since(mr.LastUpdated) > 24*time.Hour {
+		mr.BuildModelMaps()
+	}
+	name, exists := mr.IdNameMap[id]
+	if exists {
+		return name
+	}
+	log.Printf("Model ID '%s' does not exist in OpenRouter", id)
+	return "unknown-model"
+}
+
+func (mr *ModelResponse) GetModelId(name string) string {
+	if mr.NameIdMap == nil || time.Since(mr.LastUpdated) > 24*time.Hour {
+		mr.BuildModelMaps()
+	}
+	nameIdMap := make(map[string]string)
+	for k, v := range mr.NameIdMap {
+		nameIdMap[k] = v
+	}
+
+	for n, id := range nameIdMap {
+		if id == "stepfun/step-3.5-flash:free" {
+			fmt.Println("Found free model in OpenRouter with name:", n, "and id:", id)
+		}
+		if strings.Contains(strings.TrimSpace(strings.ToLower(n)), strings.TrimSpace(strings.ToLower(name))) {
+			if strings.Contains(strings.ToLower(id), "free") {
+				log.Printf("Model '%s' exists with ID '%s' \n", name, id)
+				mr.ModelNameToFreeModelIdCacheMap[name] = id
+				return id
+			} else {
+				log.Printf("Model '%s' exists with id '%s' but does not have a free version in OpenRouter\n", name, id)
+			}
+		}
+	}
+	return "unknown-model"
+}
+
 func main() {
 	server, err := LoadConfig()
 	if err != nil {
 		log.Fatalf("Configuration error: %v", err)
 	}
+	server.models = &ModelResponse{}
+	server.models.BuildModelMaps()
 
 	if err := server.Init(); err != nil {
 		log.Fatalf("Initialization error: %v", err)
