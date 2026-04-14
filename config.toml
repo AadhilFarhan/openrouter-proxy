@@ -1,0 +1,80 @@
+# Claude Proxy Configuration - Production Ready
+# Environment variables can override any setting (see documentation below)
+
+[server]
+# Server port - can be overridden with PORT environment variable
+# Default: 8080
+port = "8080"
+
+# Log file path - can be overridden with LOG_FILE environment variable
+# If empty, defaults to ./logs/claude-proxy.log relative to executable
+# Use absolute path for production deployments
+log_file = "./logs/claude-proxy.log"
+
+# Enable query logging - can be overridden with LOG_QUERIES environment variable
+# WARNING: Logging queries may contain sensitive user data
+# Set to false in production unless specifically needed for debugging
+# Default: true
+log_queries = false
+
+# Request timeout - can be overridden with OPENROUTER_TIMEOUT environment variable
+# Format: Go duration string (e.g., "30m", "1h30m")
+# Default: 30m
+timeout = "20m"
+
+[models]
+# List of preferred models to use (in order of preference)
+# The server will try these models in order before falling back
+# Models should be available as free tiers on OpenRouter
+# Example format: "provider/model-name:free"
+preferred = [
+    "openrouter/elephant-alpha"
+]
+
+# Fallback models to try when all preferred models fail
+# These are additional reliable options for redundancy
+fallback = [
+    "openrouter/elephant-alpha",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "minimax/minimax-m2.5:free"
+]
+
+# Maximum retry attempts for each model before moving to the next model
+# Each attempt uses exponential backoff (base_delay * 2^(attempt-1))
+# Default: 3
+max_retries = 10
+
+# Base delay between retries in seconds for exponential backoff
+# Actual delay = base_delay * 2^(attempt_number-1)
+# For attempt 1: 1s * 2^0 = 1s
+# For attempt 2: 1s * 2^1 = 2s
+# For attempt 3: 1s * 2^2 = 4s
+# etc.
+# Default: 1
+retry_delay = 1
+
+[connection]
+# HTTP connection pool settings
+# Tune these values based on expected concurrent traffic and OpenRouter rate limits
+
+# Maximum idle connections across all hosts
+# Increase for higher concurrent traffic
+# Default: 200
+max_idle_conns = 150
+
+# Maximum idle connections per host (OpenRouter)
+# Controls how many idle connections to keep to OpenRouter
+# Default: 100
+max_idle_conns_per_host = 30
+
+# Maximum connections per host (OpenRouter)
+# Hard limit on concurrent connections to OpenRouter
+# Default: 200
+max_conns_per_host = 150
+
+# Idle connection timeout
+# Connections idle longer than this duration are closed
+# Prevents holding onto unused connections too long
+# Format: Go duration string
+# Default: "120s"
+idle_conn_timeout = "90s"

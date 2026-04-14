@@ -1,0 +1,44 @@
+# Claude Proxy Configuration
+# Copy this file to config.toml and modify as needed
+
+[server]
+# Server port (default: 8080)
+port = "8080"
+
+# Log file path (default: ./logs/claude-proxy.log relative to executable)
+log_file = ""
+
+# Enable query logging (default: true)
+log_queries = true
+
+# Request timeout (default: 30m)
+timeout = "30m"
+
+[models]
+# List of preferred models to use (in order of preference)
+# Leave empty to use automatic model selection based on rules
+preferred = [
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "google/gemma-4-31b-it:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "stepfun/step-3.5-flash:free"
+]
+
+# Fallback models to try when preferred models fail
+# Leave empty to use the last preferred model as fallback
+fallback = [
+    "stepfun/step-3.5-flash:free"
+]
+
+# Maximum retry attempts for each model (default: 20)
+max_retries = 20
+
+# Base delay between retries in seconds (default: 1s, exponential backoff)
+retry_delay = 1
+
+[connection]
+# Connection pool settings
+max_idle_conns = 200
+max_idle_conns_per_host = 50
+max_conns_per_host = 200
+idle_conn_timeout = "120s"
