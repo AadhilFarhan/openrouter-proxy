@@ -28,13 +28,14 @@ timeout = "20m"
 # Models should be available as free tiers on OpenRouter
 # Example format: "provider/model-name:free"
 preferred = [
-    "openrouter/elephant-alpha"
+    "inclusionai/ring-2.6-1t:free"
 ]
 
 # Fallback models to try when all preferred models fail
 # These are additional reliable options for redundancy
 fallback = [
-    "openrouter/elephant-alpha",
+    "openrouter/owl-alpha",
+    "inclusionai/ring-2.6-1t:free",
     "nvidia/nemotron-3-super-120b-a12b:free",
     "minimax/minimax-m2.5:free"
 ]

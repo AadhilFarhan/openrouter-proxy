@@ -136,8 +136,8 @@ func LoadConfig() (*Server, error) {
 			Timeout:    "20m",
 		},
 		Models: ModelsConfig{
-			Preferred:  []string{"openrouter/elephant-alpha"},
-			Fallback:   []string{"nvidia/nemotron-3-super-120b-a12b:free", "minimax/minimax-m2.5:free"},
+			Preferred:  []string{"inclusionai/ring-2.6-1t:free"},
+			Fallback:   []string{"openrouter/owl-alpha", "nvidia/nemotron-3-super-120b-a12b:free", "minimax/minimax-m2.5:free"},
 			MaxRetries: 10,
 			RetryDelay: 1,
 		},
@@ -206,7 +206,7 @@ func LoadConfig() (*Server, error) {
 	// Configure models
 	preferredModels := config.Models.Preferred
 	if len(preferredModels) == 0 {
-		preferredModels = []string{"nvidia/nemotron-3-super-120b-a12b:free"}
+		preferredModels = []string{"openrouter/owl-alpha"}
 	}
 
 	fallbackModels := config.Models.Fallback
@@ -510,7 +510,7 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 					claudeReq["model"] = modelId
 					s.logger.Printf("Resolved model '%s' to free model ID '%s'", model, modelId)
 				}
-			} else if strings.Contains(model, "free") || strings.Contains(model, "elephant") {
+			} else if strings.Contains(model, "free") || strings.Contains(model, "openrouter") {
 				s.logger.Printf("Model '%s' exists in OpenRouter with name '%s'", model, modelName)
 				claudeReq["model"] = model
 			} else {
@@ -900,7 +900,7 @@ func (mr *ModelResponse) GetModelId(name string) string {
 		}
 		if strings.Contains(strings.TrimSpace(strings.ToLower(n)), strings.TrimSpace(strings.ToLower(name))) {
 			fmt.Println("ID IS: ", id, "NAME IS: ", n)
-			if strings.Contains(strings.ToLower(id), "free") || strings.Contains(strings.ToLower(id), "elephant") {
+			if strings.Contains(strings.ToLower(id), "free") || strings.Contains(strings.ToLower(id), "openrouter") {
 				log.Printf("Model '%s' exists with ID '%s' \n", name, id)
 				mr.ModelNameToFreeModelIdCacheMap[name] = id
 				return id
