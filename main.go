@@ -19,7 +19,36 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	toml "github.com/pelletier/go-toml/v2"
 )
+
+type Config struct {
+	Server     ServerConfig     `toml:"server"`
+	Models     ModelsConfig     `toml:"models"`
+	Connection ConnectionConfig `toml:"connection"`
+}
+
+type ServerConfig struct {
+	Port       string `toml:"port"`
+	LogFile    string `toml:"log_file"`
+	LogQueries bool   `toml:"log_queries"`
+	Timeout    string `toml:"timeout"`
+}
+
+type ModelsConfig struct {
+	Preferred  []string `toml:"preferred"`
+	Fallback   []string `toml:"fallback"`
+	MaxRetries int      `toml:"max_retries"`
+	RetryDelay int      `toml:"retry_delay"`
+}
+
+type ConnectionConfig struct {
+	MaxIdleConns        int    `toml:"max_idle_conns"`
+	MaxIdleConnsPerHost int    `toml:"max_idle_conns_per_host"`
+	MaxConnsPerHost     int    `toml:"max_conns_per_host"`
+	IdleConnTimeout     string `toml:"idle_conn_timeout"`
+}
 
 type Server struct {
 	apiKey           string
@@ -32,6 +61,10 @@ type Server struct {
 	timeout          time.Duration
 	logQueries       bool
 	models           *ModelResponse
+	preferredModels  []string
+	fallbackModels   []string
+	maxRetries       int
+	retryDelay       int
 }
 
 type MetricsCollector struct {
@@ -94,36 +127,71 @@ func LoadConfig() (*Server, error) {
 		return nil, fmt.Errorf("OPENROUTER_API_KEY environment variable is not set")
 	}
 
-	logFile := os.Getenv("LOG_FILE")
-	if logFile == "" {
-		exePath, err := os.Executable()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get executable path: %w", err)
-		}
-		baseDir := filepath.Dir(exePath)
-		logDir := filepath.Join(baseDir, "logs")
-		logFile = filepath.Join(logDir, "claude-proxy.log")
-		if err := os.MkdirAll(logDir, 0755); err != nil {
-			return nil, fmt.Errorf("failed to create log directory: %w", err)
-		}
+	// Load configuration from config.toml if it exists
+	config := Config{
+		Server: ServerConfig{
+			Port:       "8080",
+			LogFile:    "",
+			LogQueries: true,
+			Timeout:    "20m",
+		},
+		Models: ModelsConfig{
+			Preferred:  []string{"inclusionai/ring-2.6-1t:free"},
+			Fallback:   []string{"openrouter/owl-alpha", "nvidia/nemotron-3-super-120b-a12b:free", "minimax/minimax-m2.5:free"},
+			MaxRetries: 10,
+			RetryDelay: 1,
+		},
+		Connection: ConnectionConfig{
+			MaxIdleConns:        200,
+			MaxIdleConnsPerHost: 50,
+			MaxConnsPerHost:     200,
+			IdleConnTimeout:     "120s",
+		},
 	}
 
+	// Try to load config file
+	if configData, err := os.ReadFile("config.toml"); err == nil {
+		if err := toml.Unmarshal(configData, &config); err != nil {
+			return nil, fmt.Errorf("failed to parse config.toml: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("failed to read config.toml: %w", err)
+	}
+
+	// Override with environment variables if set
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = config.Server.Port
 	}
 
-	// Configure timeout (default: 30 minutes for AI inference)
-	timeout := 30 * time.Minute
-	if timeoutStr := os.Getenv("OPENROUTER_TIMEOUT"); timeoutStr != "" {
-		if parsed, err := time.ParseDuration(timeoutStr); err != nil {
-			return nil, fmt.Errorf("invalid OPENROUTER_TIMEOUT: %w", err)
-		} else {
-			timeout = parsed
+	logFile := os.Getenv("LOG_FILE")
+	if logFile == "" {
+		logFile = config.Server.LogFile
+		if logFile == "" {
+			exePath, err := os.Executable()
+			if err != nil {
+				return nil, fmt.Errorf("failed to get executable path: %w", err)
+			}
+			baseDir := filepath.Dir(exePath)
+			logDir := filepath.Join(baseDir, "logs")
+			logFile = filepath.Join(logDir, "claude-proxy.log")
+			if err := os.MkdirAll(logDir, 0755); err != nil {
+				return nil, fmt.Errorf("failed to create log directory: %w", err)
+			}
 		}
 	}
 
-	// Configure query logging (default: enabled)
+	// Configure timeout
+	timeoutStr := os.Getenv("OPENROUTER_TIMEOUT")
+	if timeoutStr == "" {
+		timeoutStr = config.Server.Timeout
+	}
+	timeout, err := time.ParseDuration(timeoutStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid timeout: %w", err)
+	}
+
+	// Configure query logging
 	logQueries := true
 	if logQueriesStr := os.Getenv("LOG_QUERIES"); logQueriesStr != "" {
 		if parsed, err := strconv.ParseBool(logQueriesStr); err != nil {
@@ -131,15 +199,62 @@ func LoadConfig() (*Server, error) {
 		} else {
 			logQueries = parsed
 		}
+	} else {
+		logQueries = config.Server.LogQueries
+	}
+
+	// Configure models
+	preferredModels := config.Models.Preferred
+	if len(preferredModels) == 0 {
+		preferredModels = []string{"openrouter/owl-alpha"}
+	}
+
+	fallbackModels := config.Models.Fallback
+	if len(fallbackModels) == 0 {
+		fallbackModels = []string{"nvidia/nemotron-3-super-120b-a12b:free", "minimax/minimax-m2.5:free"}
+	}
+
+	maxRetries := config.Models.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = 20
+	}
+
+	retryDelay := config.Models.RetryDelay
+	if retryDelay <= 0 {
+		retryDelay = 1
 	}
 
 	// Configure transport with optimized connection pool limits
+	maxIdleConns := config.Connection.MaxIdleConns
+	if maxIdleConns <= 0 {
+		maxIdleConns = 200
+	}
+
+	maxIdleConnsPerHost := config.Connection.MaxIdleConnsPerHost
+	if maxIdleConnsPerHost <= 0 {
+		maxIdleConnsPerHost = 50
+	}
+
+	maxConnsPerHost := config.Connection.MaxConnsPerHost
+	if maxConnsPerHost <= 0 {
+		maxConnsPerHost = 200
+	}
+
+	idleConnTimeoutStr := config.Connection.IdleConnTimeout
+	if idleConnTimeoutStr == "" {
+		idleConnTimeoutStr = "120s"
+	}
+	idleConnTimeout, err := time.ParseDuration(idleConnTimeoutStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid idle_conn_timeout: %w", err)
+	}
+
 	transport := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
-		MaxIdleConns:        200,               // Increased from 100
-		MaxIdleConnsPerHost: 50,                // Increased from 10
-		MaxConnsPerHost:     200,               // Increased from 100
-		IdleConnTimeout:     120 * time.Second, // Increased from 90s
+		MaxIdleConns:        maxIdleConns,
+		MaxIdleConnsPerHost: maxIdleConnsPerHost,
+		MaxConnsPerHost:     maxConnsPerHost,
+		IdleConnTimeout:     idleConnTimeout,
 		DisableCompression:  false,
 		ForceAttemptHTTP2:   true,
 		// Additional optimizations
@@ -155,6 +270,10 @@ func LoadConfig() (*Server, error) {
 		logQueries:       logQueries,
 		metrics:          NewMetricsCollector(),
 		openRouterClient: &http.Client{Transport: transport, Timeout: timeout},
+		preferredModels:  preferredModels,
+		fallbackModels:   fallbackModels,
+		maxRetries:       maxRetries,
+		retryDelay:       retryDelay,
 	}, nil
 }
 
@@ -230,7 +349,7 @@ func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) logUserQuery(claudeReq map[string]interface{}) {
+func (s *Server) logUserQuery(claudeReq map[string]interface{}, req *http.Request) {
 	if s.queryLogger == nil {
 		return
 	}
@@ -256,8 +375,16 @@ func (s *Server) logUserQuery(claudeReq map[string]interface{}) {
 			}
 		}
 		if len(userQueries) > 0 {
-			s.logger.Printf("User query logged") // operational log
-			s.queryLogger.Printf("=== REQUEST ===\n%s", strings.Join(userQueries, " | "))
+			// Extract client IP from request
+			clientIP := req.RemoteAddr
+			// If behind a proxy, check for common headers
+			if forwarded := req.Header.Get("X-Forwarded-For"); forwarded != "" {
+				clientIP = strings.Split(forwarded, ",")[0]
+			} else if realIP := req.Header.Get("X-Real-IP"); realIP != "" {
+				clientIP = realIP
+			}
+			s.logger.Printf("User query logged from %s", clientIP) // operational log
+			s.queryLogger.Printf("=== REQUEST FROM %s ===\n%s", clientIP, strings.Join(userQueries, " | "))
 		}
 	}
 }
@@ -266,7 +393,29 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 	startT := time.Now()
 	ctx := req.Context()
 
-	s.logger.Printf("Received %s request for %s", req.Method, req.URL.Path)
+	// Check if streaming is requested
+	streamRequested := false
+	if streamVal, ok := req.Header["Accept"]; ok {
+		for _, v := range streamVal {
+			if v == "text/event-stream" {
+				streamRequested = true
+				break
+			}
+		}
+	}
+	if streamVal, ok := req.URL.Query()["stream"]; ok {
+		if len(streamVal) > 0 && (streamVal[0] == "true" || streamVal[0] == "1") {
+			streamRequested = true
+		}
+	}
+
+	if streamRequested {
+		s.logger.Printf("Received streaming request for %s (Accept: %v, stream param: %v)", req.URL.Path, req.Header["Accept"], req.URL.Query()["stream"])
+	} else {
+		s.logger.Printf("Received normal request for %s", req.URL.Path)
+	}
+
+	// Enforce request size limit (default: 10MB)
 
 	// Enforce request size limit (default: 10MB)
 	const maxRequestSize = 10 << 20 // 10MB
@@ -288,7 +437,7 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 
 	// Log the user query (extracted from user messages) if enabled
 	if s.logQueries {
-		s.logUserQuery(claudeReq)
+		s.logUserQuery(claudeReq, req)
 	}
 
 	messages, ok := claudeReq["messages"].([]interface{})
@@ -347,9 +496,9 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 
 	// Transform model name based on rules
 	if model, ok := claudeReq["model"].(string); ok {
-		if strings.HasPrefix(model, "claude") || strings.HasPrefix(model, "step") {
-			claudeReq["model"] = "stepfun/step-3.5-flash:free"
-			s.logger.Printf("Transformed model '%s' to 'stepfun/step-3.5-flash:free'", model)
+		if strings.HasPrefix(model, "claude") || strings.HasPrefix(model, "nvidia") || strings.HasPrefix(model, "step") {
+			claudeReq["model"] = s.preferredModels[0] // Use the first preferred model for known prefixes
+			s.logger.Printf("Transformed model '%s' to '%s'", model, s.preferredModels[0])
 		} else {
 			modelName := s.models.GetModelName(model) // Just for logging
 			if modelName == "unknown-model" {
@@ -361,7 +510,7 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 					claudeReq["model"] = modelId
 					s.logger.Printf("Resolved model '%s' to free model ID '%s'", model, modelId)
 				}
-			} else if strings.Contains(model, "free") {
+			} else if strings.Contains(model, "free") || strings.Contains(model, "openrouter") {
 				s.logger.Printf("Model '%s' exists in OpenRouter with name '%s'", model, modelName)
 				claudeReq["model"] = model
 			} else {
@@ -373,17 +522,28 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 	delete(claudeReq, "context_management") // Remove context management field if present, as OpenRouter may not support it
 
 	// Check if streaming is requested
-	streamRequested := false
-	if streamVal, ok := claudeReq["stream"].(bool); ok {
+	streamRequested = false
+	if streamVal, ok := claudeReq["stream"].(bool); ok && streamVal {
 		streamRequested = streamVal
 	}
 
-	// Retry loop: try primary model, fallback to stepfun on persistent errors
-	const maxRetries = 4
-	retryableModels := []string{"stepfun/step-3.5-flash:free", "qwen/qwen3.6-plus:free"}
+	// Retry loop: try preferred models, then fallback models on persistent errors
+	var preferredModels []string
+	var fallbackModels []string
 	if model, ok := claudeReq["model"].(string); ok {
-		retryableModels[0] = model
+		// If user specified a model, try it first, then fall back to configured models
+		preferredModels = append([]string{model}, s.preferredModels...)
+		fallbackModels = s.fallbackModels
+	} else {
+		// Use configured models
+		preferredModels = s.preferredModels
+		fallbackModels = s.fallbackModels
 	}
+
+	// Combine preferred and fallback models for retry attempts
+	var retryableModels []string
+	retryableModels = append(retryableModels, preferredModels...)
+	retryableModels = append(retryableModels, fallbackModels...)
 
 	startTime := time.Now()
 	var resp *http.Response
@@ -399,11 +559,23 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		if modelToTry != retryableModels[0] {
-			s.logger.Printf("Primary model failed after %d attempts, falling back to %s", maxRetries, modelToTry)
+		isPreferred := false
+		for _, pm := range preferredModels {
+			if pm == modelToTry {
+				isPreferred = true
+				break
+			}
 		}
 
-		for attempt := 0; attempt < maxRetries; attempt++ {
+		if !isPreferred && len(preferredModels) > 0 {
+			s.logger.Printf("Preferred models failed after %d attempts, falling back to %s", s.maxRetries, modelToTry)
+		}
+
+		for attempt := 0; attempt < s.maxRetries; attempt++ {
+			if attempt > 0 {
+				delay := time.Duration(1<<uint(attempt-1)) * time.Second * time.Duration(s.retryDelay)
+				time.Sleep(delay) // Exponential backoff with configurable base delay
+			}
 			rt, err := http.NewRequestWithContext(ctx, "POST", "https://openrouter.ai/api/v1/messages", bytes.NewReader(bodyForRequest))
 			if err != nil {
 				s.logError("Error while creating request for model "+modelToTry, err)
@@ -412,21 +584,21 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 			}
 			rt.Header.Set("Content-Type", "application/json")
 			rt.Header.Set("Authorization", "Bearer "+s.apiKey)
-			rt.Header.Set("HTTP-Referer", "http://localhost:8080")
+			rt.Header.Set("HTTP-Referer", "http://localhost:"+s.port)
 			rt.Header.Set("X-Title", "Claude-Code-Proxy")
 
 			resp, err = s.openRouterClient.Do(rt)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					s.logger.Printf("OpenRouter request timeout (model: %s, attempt %d/%d)", modelToTry, attempt+1, maxRetries)
+					s.logger.Printf("OpenRouter request timeout (model: %s, attempt %d/%d)", modelToTry, attempt+1, s.maxRetries)
 				} else {
-					s.logger.Printf("OpenRouter request error (model: %s, attempt %d/%d): %v", modelToTry, attempt+1, maxRetries, err)
+					s.logger.Printf("OpenRouter request error (model: %s, attempt %d/%d): %v", modelToTry, attempt+1, s.maxRetries, err)
 				}
-				if attempt < maxRetries-1 {
-					time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
+				if attempt < s.maxRetries-1 {
+					continue
 				}
 				resp = nil
-				continue
+				break
 			}
 
 			// 429 or 5xx errors are retryable
@@ -434,8 +606,10 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 				break
 			}
 
-			s.logger.Printf("OpenRouter returned %d (model: %s, attempt %d/%d)", resp.StatusCode, modelToTry, attempt+1, maxRetries)
-			if resp.StatusCode >= 400 && attempt < maxRetries-1 {
+			time.Sleep(500 * time.Millisecond)
+
+			s.logger.Printf("OpenRouter returned %d (model: %s, attempt %d/%d)", resp.StatusCode, modelToTry, attempt+1, s.maxRetries)
+			if resp.StatusCode >= 400 && attempt < s.maxRetries-1 {
 				resp.Body.Close()
 				resp = nil
 				continue
@@ -523,6 +697,11 @@ func (s *Server) messageHandler(w http.ResponseWriter, req *http.Request) {
 
 		// Copy headers from OpenRouter response to client
 		for k, v := range resp.Header {
+			// Skip headers that would conflict with our response
+			switch strings.ToLower(k) {
+			case "content-length", "transfer-encoding":
+				continue
+			}
 			for _, vv := range v {
 				w.Header().Add(k, vv)
 			}
@@ -716,11 +895,12 @@ func (mr *ModelResponse) GetModelId(name string) string {
 	}
 
 	for n, id := range nameIdMap {
-		if id == "stepfun/step-3.5-flash:free" {
+		if id == "nvidia/nemotron-3-super-120b-a12b:free" {
 			fmt.Println("Found free model in OpenRouter with name:", n, "and id:", id)
 		}
 		if strings.Contains(strings.TrimSpace(strings.ToLower(n)), strings.TrimSpace(strings.ToLower(name))) {
-			if strings.Contains(strings.ToLower(id), "free") {
+			fmt.Println("ID IS: ", id, "NAME IS: ", n)
+			if strings.Contains(strings.ToLower(id), "free") || strings.Contains(strings.ToLower(id), "openrouter") {
 				log.Printf("Model '%s' exists with ID '%s' \n", name, id)
 				mr.ModelNameToFreeModelIdCacheMap[name] = id
 				return id
